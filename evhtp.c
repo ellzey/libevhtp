@@ -4,6 +4,7 @@
  * @brief implementation file for libevhtp.
  */
 
+#define _GNU_SOURCE
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
@@ -12,6 +13,7 @@
 #include <strings.h>
 #include <inttypes.h>
 #include <stdbool.h>
+#include <sys/param.h> /* MIN/MAX macro */
 #ifndef WIN32
 #include <sys/socket.h>
 #include <netinet/in.h>
@@ -29,6 +31,7 @@
 #include <limits.h>
 #include <event2/dns.h>
 
+#include "evhtp/config.h"
 #include "internal.h"
 #include "numtoa.h"
 #include "evhtp/evhtp.h"
@@ -2013,15 +2016,51 @@ htp__request_parse_fini_(htparser * p)
 } /* htp__request_parse_fini_ */
 
 static int
+htp__evbuffer_add_iovec_(struct evbuffer * buf, struct evbuffer_iovec * vec, int n_vec)
+{
+    int    n;
+    size_t to_alloc;
+    char * bufptr;
+    size_t to_copy;
+
+    to_alloc = 0;
+
+    for (n = 0; n < n_vec; n++) {
+        to_alloc += vec[n].iov_len;
+    }
+
+    char buffer[to_alloc];
+
+    bufptr  = buffer;
+    to_copy = to_alloc;
+
+    for (n = 0; n < n_vec; n++)
+    {
+        size_t copy = MIN(vec[n].iov_len, to_copy);
+
+        bufptr   = mempcpy(bufptr, vec[n].iov_base, copy);
+        to_copy -= copy;
+
+        if (evhtp_unlikely(to_copy == 0)) {
+            break;
+        }
+    }
+
+    return evbuffer_add(buf, buffer, to_alloc);
+}
+
+static int
 htp__create_headers_(evhtp_header_t * header, void * arg)
 {
-    struct evbuffer * buf = arg;
+    struct evbuffer     * buf    = arg;
+    struct evbuffer_iovec iov[4] = {
+        { header->key, header->klen },
+        { ": ",        2            },
+        { header->val, header->vlen },
+        { "\r\n",      2            }
+    };
 
-    evbuffer_expand(buf, header->klen + 2 + header->vlen + 2);
-    evbuffer_add(buf, header->key, header->klen);
-    evbuffer_add(buf, ": ", 2);
-    evbuffer_add(buf, header->val, header->vlen);
-    evbuffer_add(buf, "\r\n", 2);
+    htp__evbuffer_add_iovec_(buf, iov, 4);
 
     return 0;
 }
@@ -2124,19 +2163,26 @@ check_proto:
 
     evhtp_modp_u32toa((uint32_t)code, out_buf);
 
-    sres = snprintf(res_buf, sizeof(res_buf), "HTTP/%c.%c %s %s\r\n",
-        major, minor, out_buf, status_code_to_str(code));
+    /* create the initial reply status via scatter-gather io (note: this used to
+     * be a formatted write which led to some spurrious performance problems.
+     * This now uses iovec/scatter/gather to create the status reply portion
+     * of the header.
+     */
+    {
+        const char          * status_str = status_code_to_str(code);
+        struct evbuffer_iovec iov[9]     = {
+            { "HTTP/1",           5                  }, /* data == "HTTP/" */
+            { (void *)&major,     1                  }, /* data == "HTTP/X */
+            { ".",                1                  }, /* data == "HTTP/X." */
+            { (void *)&minor,     1                  }, /* data == "HTTP/X.X" */
+            { " ",                1                  }, /* data == "HTTP/X.X " */
+            { out_buf,            strlen(out_buf)    }, /* data = "HTTP/X.X YYY" */
+            { " ",                1                  }, /* data = "HTTP/X.X YYY " */
+            { (void *)status_str, strlen(status_str) }, /* data = "HTTP/X.X YYY ZZZ" */
+            { "\r\n",             2                  }, /* data = "HTTP/X.X YYY ZZZ\r\n" */
+        };
 
-    if (sres >= sizeof(res_buf) || sres < 0) {
-        /* failed to fit the whole thing in the res_buf, so just fallback to
-         * using evbuffer_add_printf().
-         */
-        evbuffer_add_printf(buf, "HTTP/%c.%c %d %s\r\n",
-            major, minor,
-            code, status_code_to_str(code));
-    } else {
-        /* copy the res_buf using evbuffer_add() instead of add_printf() */
-        evbuffer_add(buf, res_buf, sres);
+        htp__evbuffer_add_iovec_(buf, iov, 9);
     }
 
     evhtp_headers_for_each(request->headers_out, htp__create_headers_, buf);
@@ -2826,17 +2872,29 @@ htp__accept_cb_(struct evconnlistener * serv, int fd, struct sockaddr * s, int s
 
 #ifndef EVHTP_DISABLE_SSL
 #ifndef EVHTP_DISABLE_EVTHR
+
+#ifndef WIN32
+#define _HTP_tid (unsigned long)pthread_self()
+#else
+#define _HTP_tid pthread_self().p
+#endif
+
+#if OPENSSL_VERSION_NUMBER < 0x10000000L
 static unsigned long
 htp__ssl_get_thread_id_(void)
 {
-#ifndef WIN32
+    return _HTP_tid;
+}
 
-    return (unsigned long)pthread_self();
 #else
 
-    return (unsigned long)(pthread_self().p);
-#endif
+static void
+htp__ssl_get_thread_id_(CRYPTO_THREADID * id)
+{
+    CRYPTO_THREADID_set_numeric(id, _HTP_tid);
 }
+
+#endif
 
 static void
 htp__ssl_thread_lock_(int mode, int type, const char * file, int line)
@@ -3428,6 +3486,7 @@ evhtp_unescape_string(unsigned char ** out, unsigned char * str, size_t str_len)
         } /* switch */
     }
 
+    *out = optr;
     return 0;
 }         /* evhtp_unescape_string */
 
@@ -4694,7 +4753,12 @@ evhtp_ssl_use_threads(void)
         pthread_mutex_init(&(ssl_locks[i]), NULL);
     }
 
+#if OPENSSL_VERSION_NUMBER < 0x10000000L
     CRYPTO_set_id_callback(htp__ssl_get_thread_id_);
+#else
+    CRYPTO_THREADID_set_callback(htp__ssl_get_thread_id_);
+#endif
+
     CRYPTO_set_locking_callback(htp__ssl_thread_lock_);
 
     return 0;
